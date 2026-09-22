@@ -1,0 +1,27 @@
+# Node generated files
+node_modules
+npm-debug.log
+
+# OS generated files
+Thumbs.db
+.DS_Store
+
+# Ignored files
+src/
+lib/*.map
+tests/
+ports/
+images/
+coverage/
+package
+*.tgz
+.vscode/
+.eslintrc.json
+.github/
+.git/
+cspell.json
+tsconfig.json
+eslint.config.mjs
+vitest.config.ts
+index.ts
+historical-contributors.txt
