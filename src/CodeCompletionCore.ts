@@ -8,12 +8,63 @@
 import {
     ATN, ATNState, IntervalSet, Parser, ParserRuleContext, Token, TokenStream, Vocabulary, Transition,
     PredicateTransition, RuleTransition, RuleStartState, PrecedencePredicateTransition,
+    CommonToken, Interval, IntStream, TokenSource,
 } from "antlr4ng";
 
 import { longestCommonPrefix } from "./utils.js";
 
 export type TokenList = number[];
 export type RuleList = number[];
+
+/** A token edit expressed as a half-open interval in the old token sequence. */
+export interface ITokenEdit {
+    start: number;
+    deleteCount: number;
+    tokens?: Token[];
+}
+
+/** Why one or more cached incremental prefixes had to be discarded. */
+export type IncrementalInvalidationReason =
+    | "parser-replaced"
+    | "grammar-changed"
+    | "configuration-changed"
+    | "context-changed"
+    | "predicate-version-changed"
+    | "token-sequence-changed"
+    | "token-index-renumbered"
+    | "edit-overlap"
+    | "eof-changed"
+    | "cache-limit"
+    | "cleared";
+
+/** Statistics for one incremental completion request. */
+export interface IIncrementalCompletionRunStats {
+    persistentPrefixHits: number;
+    shortcutHits: number;
+    recomputedStates: number;
+}
+
+/** Cumulative diagnostics for an incremental completion session. */
+export interface IIncrementalCompletionDiagnostics {
+    requests: number;
+    cachedRuleInvocations: number;
+    persistentPrefixHits: number;
+    shortcutHits: number;
+    recomputedStates: number;
+    evictedRuleInvocations: number;
+    invalidationEvents: Record<IncrementalInvalidationReason, number>;
+    invalidatedRuleInvocations: Record<IncrementalInvalidationReason, number>;
+    lastRun: IIncrementalCompletionRunStats;
+}
+
+/** Options for an {@link IncrementalCompletionSession}. */
+export interface IIncrementalCompletionSessionOptions {
+    preferredRules?: Set<number>;
+    ignoredTokens?: Set<number>;
+    translateRulesTopDown?: boolean;
+    predicateResultVersion?: number | string;
+    maxCachedRuleInvocations?: number;
+}
 
 export interface ICandidateRule {
     startTokenIndex: number;
@@ -62,9 +113,10 @@ class FollowSetsHolder {
     public sets: FollowSetWithPath[];
     public combined: IntervalSet;
     public isExhaustive: boolean;
+    public usesPredicate = false;
 }
 
-type FollowSetsPerState = Map<number, FollowSetsHolder>;
+export type FollowSetsPerState = Map<number, FollowSetsHolder>;
 
 /** Token stream position info after a rule was processed. */
 type RuleEndStatus = Set<number>;
@@ -72,6 +124,35 @@ type RuleEndStatus = Set<number>;
 interface IPipelineEntry {
     state: ATNState;
     tokenListIndex: number;
+}
+
+interface IRuleEndStatus {
+    endIndexes: Set<number>;
+    reachedCaret: boolean;
+    dependencyMinAbsoluteIndex: number;
+    dependencyMaxAbsoluteIndex: number;
+    usesPredicate: boolean;
+}
+
+interface IPersistentRuleInvocation {
+    startAbsoluteIndex: number;
+    precedence: number;
+    endAbsoluteIndexes: Set<number>;
+    dependencyMinAbsoluteIndex: number;
+    dependencyMaxAbsoluteIndex: number;
+    usesPredicate: boolean;
+    lastUsed: number;
+}
+
+export type PersistentRuleCache = Map<number, Map<string, IPersistentRuleInvocation>>;
+
+export interface ICompletionRunContext {
+    inputTokens: Token[];
+    persistentCache: PersistentRuleCache;
+    followSets: FollowSetsPerState;
+    predicateResultVersion: number | string;
+    accessTick: number;
+    stats: IIncrementalCompletionRunStats;
 }
 
 /** The main class for doing the collection process. */
@@ -132,6 +213,13 @@ export class CodeCompletionCore {
     private ruleNames: string[];
     private tokens: Token[];
     private precedenceStack: number[];
+    private completionRun: ICompletionRunContext | undefined;
+    private activeRuleCalls: Array<{
+        reachedCaret: boolean;
+        dependencyMinAbsoluteIndex: number;
+        dependencyMaxAbsoluteIndex: number;
+        usesPredicate: boolean;
+    }> = [];
 
     private tokenStartIndex = 0;
     private statesProcessed = 0;
@@ -140,7 +228,7 @@ export class CodeCompletionCore {
      * A mapping of rule index + token stream position to end token positions.
      * A rule which has been visited before with the same input position will always produce the same output positions.
      */
-    private shortcutMap: Map<number, Map<number, RuleEndStatus>> = new Map();
+    private shortcutMap: Map<number, Map<string, IRuleEndStatus>> = new Map();
 
     /** The collected candidates (rules and tokens). */
     private candidates: CandidatesCollection = new CandidatesCollection();
@@ -166,35 +254,87 @@ export class CodeCompletionCore {
      * @returns The collection of completion candidates.
      */
     public collectCandidates(caretTokenIndex: number, context?: ParserRuleContext): CandidatesCollection {
+        return this.runCollectCandidates(caretTokenIndex, context);
+    }
+
+    /** @internal */
+    public collectCandidatesForSession(caretTokenIndex: number, context: ParserRuleContext | undefined,
+        runContext: ICompletionRunContext): CandidatesCollection {
+        return this.runCollectCandidates(caretTokenIndex, context, runContext);
+    }
+
+    /** @internal */
+    public get parserATN(): ATN {
+        return this.atn;
+    }
+
+    /** @internal */
+    public get parserInstance(): Parser {
+        return this.parser;
+    }
+
+    /** @internal */
+    public get processedStates(): number {
+        return this.statesProcessed;
+    }
+
+    /** @internal */
+    public setParserInstance(parser: Parser): void {
+        this.parser = parser;
+        this.atn = parser.atn;
+        this.vocabulary = parser.vocabulary;
+        this.ruleNames = parser.ruleNames;
+    }
+
+    private runCollectCandidates(caretTokenIndex: number, context?: ParserRuleContext,
+        runContext?: ICompletionRunContext): CandidatesCollection {
         this.shortcutMap.clear();
         this.candidates.rules.clear();
         this.candidates.tokens.clear();
         this.statesProcessed = 0;
         this.precedenceStack = [];
+        this.activeRuleCalls = [];
+        this.completionRun = runContext;
 
         this.tokenStartIndex = context?.start ? context.start.tokenIndex : 0;
-        // eslint-disable-next-line no-underscore-dangle
-        const tokenStream: TokenStream = this.parser.tokenStream;
 
         this.tokens = [];
-        let offset = this.tokenStartIndex;
-        while (true) {
-            const token = tokenStream.get(offset++);
-            if (!token) {
-                break;
-            }
-            if (token.channel === Token.DEFAULT_CHANNEL) {
-                this.tokens.push(token);
+        if (runContext) {
+            for (const token of runContext.inputTokens) {
+                if (token.channel === Token.DEFAULT_CHANNEL) {
+                    this.tokens.push(token);
 
-                if (token.tokenIndex >= caretTokenIndex || token.type === Token.EOF) {
+                    if (token.tokenIndex >= caretTokenIndex || token.type === Token.EOF) {
+                        break;
+                    }
+                }
+
+                if (token.type === Token.EOF) {
                     break;
                 }
             }
+        } else {
+            // eslint-disable-next-line no-underscore-dangle
+            const tokenStream: TokenStream = this.parser.tokenStream;
+            let offset = this.tokenStartIndex;
+            while (true) {
+                const token = tokenStream.get(offset++);
+                if (!token) {
+                    break;
+                }
+                if (token.channel === Token.DEFAULT_CHANNEL) {
+                    this.tokens.push(token);
 
-            // Do not check for the token index here, as we want to end with the first unhidden token on or after
-            // the caret.
-            if (token.type === Token.EOF) {
-                break;
+                    if (token.tokenIndex >= caretTokenIndex || token.type === Token.EOF) {
+                        break;
+                    }
+                }
+
+                // Do not check for the token index here, as we want to end with the first unhidden token on
+                // or after the caret.
+                if (token.type === Token.EOF) {
+                    break;
+                }
             }
         }
 
@@ -365,16 +505,20 @@ export class CodeCompletionCore {
         const sets: FollowSetWithPath[] = [];
         const stateStack: ATNState[] = [];
         const ruleStack: number[] = [];
-        const isExhaustive = this.collectFollowSets(start, stop, sets, stateStack, ruleStack);
+        const holder = new FollowSetsHolder();
+        holder.sets = sets;
+        holder.combined = new IntervalSet();
+        holder.isExhaustive = true;
+        holder.usesPredicate = false;
+        holder.isExhaustive = this.collectFollowSets(start, stop, holder, stateStack, ruleStack);
 
         // Sets are split by path to allow translating them to preferred rules. But for quick hit tests
         // it is also useful to have a set with all symbols combined.
-        const combined = new IntervalSet();
-        for (const set of sets) {
-            combined.addSet(set.intervals);
+        for (const set of holder.sets) {
+            holder.combined.addSet(set.intervals);
         }
 
-        return { sets, isExhaustive, combined };
+        return holder;
     }
 
     /**
@@ -389,8 +533,8 @@ export class CodeCompletionCore {
      * @returns true if the follow sets is exhaustive, i.e. we terminated before the rule end was reached, so no
      * subsequent rules could add tokens
      */
-    private collectFollowSets(s: ATNState, stopState: ATNState, followSets: FollowSetWithPath[], stateStack: ATNState[],
-        ruleStack: number[]): boolean {
+    private collectFollowSets(s: ATNState, stopState: ATNState, holder: FollowSetsHolder,
+        stateStack: ATNState[], ruleStack: number[]): boolean {
 
         if (stateStack.find((x) => { return x === s; })) {
             return true;
@@ -413,32 +557,33 @@ export class CodeCompletionCore {
 
                 ruleStack.push(ruleTransition.target.ruleIndex);
                 const ruleFollowSetsIsExhaustive = this.collectFollowSets(
-                    transition.target, stopState, followSets, stateStack, ruleStack);
+                    transition.target, stopState, holder, stateStack, ruleStack);
                 ruleStack.pop();
 
                 // If the subrule had an epsilon transition to the rule end, the tokens added to
                 // the follow set are non-exhaustive and we should continue processing subsequent transitions post-rule
                 if (!ruleFollowSetsIsExhaustive) {
                     const nextStateFollowSetsIsExhaustive = this.collectFollowSets(
-                        ruleTransition.followState, stopState, followSets, stateStack, ruleStack);
+                        ruleTransition.followState, stopState, holder, stateStack, ruleStack);
                     isExhaustive &&= nextStateFollowSetsIsExhaustive;
                 }
 
             } else if (transition.transitionType === Transition.PREDICATE) {
+                holder.usesPredicate = true;
                 if (this.checkPredicate(transition as PredicateTransition)) {
                     const nextStateFollowSetsIsExhaustive = this.collectFollowSets(
-                        transition.target, stopState, followSets, stateStack, ruleStack);
+                        transition.target, stopState, holder, stateStack, ruleStack);
                     isExhaustive &&= nextStateFollowSetsIsExhaustive;
                 }
             } else if (transition.isEpsilon) {
                 const nextStateFollowSetsIsExhaustive = this.collectFollowSets(
-                    transition.target, stopState, followSets, stateStack, ruleStack);
+                    transition.target, stopState, holder, stateStack, ruleStack);
                 isExhaustive &&= nextStateFollowSetsIsExhaustive;
             } else if (transition.transitionType === Transition.WILDCARD) {
                 const set = new FollowSetWithPath();
                 set.intervals = IntervalSet.of(Token.MIN_USER_TOKEN_TYPE, this.atn.maxTokenType);
                 set.path = ruleStack.slice();
-                followSets.push(set);
+                holder.sets.push(set);
             } else {
                 let label = transition.label;
                 if (label && label.length > 0) {
@@ -449,7 +594,7 @@ export class CodeCompletionCore {
                     set.intervals = label ?? new IntervalSet();
                     set.path = ruleStack.slice();
                     set.following = this.getFollowingTokens(transition);
-                    followSets.push(set);
+                    holder.sets.push(set);
                 }
             }
         }
@@ -472,26 +617,80 @@ export class CodeCompletionCore {
      * @returns the set of token stream indexes (which depend on the ways that had to be taken).
      */
     private processRule(startState: RuleStartState, tokenListIndex: number, callStack: RuleWithStartTokenList,
-        precedence: number, indentation: number): RuleEndStatus {
+        precedence: number, indentation: number): IRuleEndStatus {
+        const startToken = this.tokens[tokenListIndex];
+        const startAbsoluteIndex = startToken.tokenIndex;
+        const ownCall = {
+            reachedCaret: tokenListIndex >= this.tokens.length - 1,
+            dependencyMinAbsoluteIndex: startAbsoluteIndex,
+            dependencyMaxAbsoluteIndex: startAbsoluteIndex,
+            usesPredicate: false,
+        };
+        this.activeRuleCalls.push(ownCall);
 
-        // Start with rule specific handling before going into the ATN walk.
+        const finishCall = (status: IRuleEndStatus): IRuleEndStatus => {
+            const parent = this.activeRuleCalls[this.activeRuleCalls.length - 2];
+            if (parent) {
+                parent.reachedCaret ||= status.reachedCaret;
+                parent.dependencyMinAbsoluteIndex = Math.min(parent.dependencyMinAbsoluteIndex,
+                    status.dependencyMinAbsoluteIndex);
+                parent.dependencyMaxAbsoluteIndex = Math.max(parent.dependencyMaxAbsoluteIndex,
+                    status.dependencyMaxAbsoluteIndex);
+                parent.usesPredicate ||= status.usesPredicate;
+            }
+            this.activeRuleCalls.pop();
 
-        // Check first if we've taken this path with the same input before.
+            return status;
+        };
+
+        const persistentKey = `${startAbsoluteIndex}:${precedence}`;
+        const persistentEntry = this.completionRun?.persistentCache
+            .get(startState.ruleIndex)?.get(persistentKey);
+        if (persistentEntry) {
+            const endIndexes = new Set<number>();
+            for (const token of this.tokens) {
+                if (persistentEntry.endAbsoluteIndexes.has(token.tokenIndex)) {
+                    endIndexes.add(this.tokens.indexOf(token));
+                }
+            }
+            if (endIndexes.size === persistentEntry.endAbsoluteIndexes.size) {
+                ++this.completionRun!.stats.persistentPrefixHits;
+                persistentEntry.lastUsed = this.completionRun.accessTick;
+
+                return finishCall({
+                    endIndexes,
+                    reachedCaret: false,
+                    dependencyMinAbsoluteIndex: persistentEntry.dependencyMinAbsoluteIndex,
+                    dependencyMaxAbsoluteIndex: persistentEntry.dependencyMaxAbsoluteIndex,
+                    usesPredicate: persistentEntry.usesPredicate,
+                });
+            }
+        }
+
+        const shortcutKey = `${tokenListIndex}:${precedence}`;
         let positionMap = this.shortcutMap.get(startState.ruleIndex);
         if (!positionMap) {
             positionMap = new Map();
             this.shortcutMap.set(startState.ruleIndex, positionMap);
-        } else {
-            if (positionMap.has(tokenListIndex)) {
-                if (this.showDebugOutput) {
-                    console.log("=====> shortcut");
-                }
-
-                return positionMap.get(tokenListIndex)!;
+        } else if (positionMap.has(shortcutKey)) {
+            const status = positionMap.get(shortcutKey)!;
+            if (this.completionRun) {
+                ++this.completionRun.stats.shortcutHits;
             }
+            if (this.showDebugOutput) {
+                console.log("=====> shortcut");
+            }
+
+            return finishCall(status);
         }
 
-        const result: RuleEndStatus = new Set<number>();
+        const result: IRuleEndStatus = {
+            endIndexes: new Set<number>(),
+            reachedCaret: false,
+            dependencyMinAbsoluteIndex: startAbsoluteIndex,
+            dependencyMaxAbsoluteIndex: startAbsoluteIndex,
+            usesPredicate: false,
+        };
 
         // For rule start states we determine and cache the follow set, which gives us 3 advantages:
         // 1) We can quickly check if a symbol would be matched when we follow that rule. We can so check in advance
@@ -500,7 +699,7 @@ export class CodeCompletionCore {
         // 3) We get this lookup for free with any 2nd or further visit of the same rule, which often happens
         //    in non trivial grammars, especially with (recursive) expressions and of course when invoking code
         //    completion multiple times.
-        let setsPerState = CodeCompletionCore.followSetsByATN.get(this.parser.constructor.name);
+        let setsPerState: FollowSetsPerState | undefined = this.completionRun?.followSets;
         if (!setsPerState) {
             setsPerState = new Map();
             CodeCompletionCore.followSetsByATN.set(this.parser.constructor.name, setsPerState);
@@ -512,9 +711,11 @@ export class CodeCompletionCore {
             followSets = this.determineFollowSets(startState, stop);
             setsPerState.set(startState.stateNumber, followSets);
         }
+        result.usesPredicate ||= followSets.usesPredicate;
+        ownCall.usesPredicate ||= followSets.usesPredicate;
 
         // Get the token index where our rule starts from our (possibly filtered) token list
-        const startTokenIndex = this.tokens[tokenListIndex].tokenIndex;
+        const startTokenIndex = startAbsoluteIndex;
 
         callStack.push({
             startTokenIndex,
@@ -522,6 +723,8 @@ export class CodeCompletionCore {
         });
 
         if (tokenListIndex >= this.tokens.length - 1) { // At caret?
+            result.reachedCaret = true;
+            ownCall.reachedCaret = true;
             if (this.preferredRules.has(startState.ruleIndex)) {
                 // No need to go deeper when collecting entries and we reach a rule that we want to collect anyway.
                 this.translateStackToRuleIndex(callStack);
@@ -564,12 +767,13 @@ export class CodeCompletionCore {
             if (!followSets.isExhaustive) {
                 // If we're at the caret but the follow sets is non-exhaustive (empty or all tokens are optional),
                 // we should continue to collect tokens following this rule
-                result.add(tokenListIndex);
+                result.endIndexes.add(tokenListIndex);
             }
 
             callStack.pop();
+            positionMap.set(shortcutKey, result);
 
-            return result;
+            return finishCall(result);
 
         } else {
             // Process the rule if we either could pass it without consuming anything (epsilon transition)
@@ -578,8 +782,9 @@ export class CodeCompletionCore {
             const currentSymbol = this.tokens[tokenListIndex].type;
             if (followSets.isExhaustive && !followSets.combined.contains(currentSymbol)) {
                 callStack.pop();
+                positionMap.set(shortcutKey, result);
 
-                return result;
+                return finishCall(result);
             }
         }
 
@@ -602,6 +807,12 @@ export class CodeCompletionCore {
             const currentSymbol = this.tokens[currentEntry.tokenListIndex].type;
 
             const atCaret = currentEntry.tokenListIndex >= this.tokens.length - 1;
+            const currentAbsoluteIndex = this.tokens[currentEntry.tokenListIndex].tokenIndex;
+            result.dependencyMinAbsoluteIndex = Math.min(result.dependencyMinAbsoluteIndex, currentAbsoluteIndex);
+            result.dependencyMaxAbsoluteIndex = Math.max(result.dependencyMaxAbsoluteIndex, currentAbsoluteIndex);
+            if (atCaret) {
+                result.reachedCaret = true;
+            }
             if (this.showDebugOutput) {
                 this.printDescription(indentation, currentEntry.state, this.generateBaseDescription(currentEntry.state),
                     currentEntry.tokenListIndex);
@@ -612,7 +823,7 @@ export class CodeCompletionCore {
 
             if ((currentEntry.state.constructor as typeof ATNState).stateType === ATNState.RULE_STOP) {
                 // Record the token index we are at, to report it to the caller.
-                result.add(currentEntry.tokenListIndex);
+                result.endIndexes.add(currentEntry.tokenListIndex);
                 continue;
             }
 
@@ -626,7 +837,13 @@ export class CodeCompletionCore {
                         const ruleTransition = transition as RuleTransition;
                         const endStatus = this.processRule(transition.target as RuleStartState,
                             currentEntry.tokenListIndex, callStack, ruleTransition.precedence, indentation + 1);
-                        for (const position of endStatus) {
+                        result.reachedCaret ||= endStatus.reachedCaret;
+                        result.usesPredicate ||= endStatus.usesPredicate;
+                        result.dependencyMinAbsoluteIndex = Math.min(result.dependencyMinAbsoluteIndex,
+                            endStatus.dependencyMinAbsoluteIndex);
+                        result.dependencyMaxAbsoluteIndex = Math.max(result.dependencyMaxAbsoluteIndex,
+                            endStatus.dependencyMaxAbsoluteIndex);
+                        for (const position of endStatus.endIndexes) {
                             statePipeline.push({
                                 state: (<RuleTransition>transition).followState,
                                 tokenListIndex: position,
@@ -636,7 +853,9 @@ export class CodeCompletionCore {
                     }
 
                     case Transition.PREDICATE: {
-                        if (this.checkPredicate(transition as PredicateTransition)) {
+                        const predicateTransition = transition as PredicateTransition;
+                        result.usesPredicate = true;
+                        if (this.checkPredicate(predicateTransition)) {
                             statePipeline.push({
                                 state: transition.target,
                                 tokenListIndex: currentEntry.tokenListIndex,
@@ -659,6 +878,7 @@ export class CodeCompletionCore {
 
                     case Transition.WILDCARD: {
                         if (atCaret) {
+                            result.reachedCaret = true;
                             if (!this.translateStackToRuleIndex(callStack)) {
                                 for (const token of IntervalSet.of(Token.MIN_USER_TOKEN_TYPE, this.atn.maxTokenType)
                                     .toArray()) {
@@ -693,6 +913,7 @@ export class CodeCompletionCore {
                             }
 
                             if (atCaret) {
+                                result.reachedCaret = true;
                                 if (!this.translateStackToRuleIndex(callStack)) {
                                     const list = set.toArray();
                                     const hasTokenSequence = list.length === 1;
@@ -733,15 +954,42 @@ export class CodeCompletionCore {
             }
         }
 
+        result.reachedCaret ||= ownCall.reachedCaret;
+        result.dependencyMinAbsoluteIndex = Math.min(result.dependencyMinAbsoluteIndex,
+            ownCall.dependencyMinAbsoluteIndex);
+        result.dependencyMaxAbsoluteIndex = Math.max(result.dependencyMaxAbsoluteIndex,
+            ownCall.dependencyMaxAbsoluteIndex);
+        result.usesPredicate ||= ownCall.usesPredicate;
+
         callStack.pop();
         if (startState.isLeftRecursiveRule) {
             this.precedenceStack.pop();
         }
 
         // Cache the result, for later lookup to avoid duplicate walks.
-        positionMap.set(tokenListIndex, result);
+        positionMap.set(shortcutKey, result);
 
-        return result;
+        if (this.completionRun && !result.reachedCaret) {
+            let ruleCache = this.completionRun.persistentCache.get(startState.ruleIndex);
+            if (!ruleCache) {
+                ruleCache = new Map();
+                this.completionRun.persistentCache.set(startState.ruleIndex, ruleCache);
+            }
+
+            ruleCache.set(persistentKey, {
+                startAbsoluteIndex,
+                precedence,
+                endAbsoluteIndexes: new Set([...result.endIndexes].map((index) => {
+                    return this.tokens[index]!.tokenIndex;
+                })),
+                dependencyMinAbsoluteIndex: result.dependencyMinAbsoluteIndex,
+                dependencyMaxAbsoluteIndex: result.dependencyMaxAbsoluteIndex,
+                usesPredicate: result.usesPredicate,
+                lastUsed: this.completionRun.accessTick,
+            });
+        }
+
+        return finishCall(result);
     }
 
     private generateBaseDescription(state: ATNState): string {

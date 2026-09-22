@@ -21,6 +21,7 @@ export * from "./src/TypedSymbol.js";
 export * from "./src/VariableSymbol.js";
 
 export * from "./src/CodeCompletionCore.js";
+export * from "./src/IncrementalCompletionSession.js";
 export * from "./src/SymbolTable.js";
 export * from "./src/DuplicateSymbolError.js";
 
