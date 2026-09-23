@@ -28,6 +28,29 @@ export interface IRuleWithStartToken {
 export type RuleWithStartTokenList = IRuleWithStartToken[];
 
 /**
+ * The minimal token information required by the code completion core. Real ANTLR Token objects fulfill this
+ * interface, which also allows incremental sessions to feed in lightweight snapshots without a backing input
+ * stream.
+ */
+export interface ICompletionToken {
+    type: number;
+    tokenIndex: number;
+    channel: number;
+}
+
+/**
+ * A cached result of walking a single rule from a given token list index.
+ * endStatus contains the token list positions at which the rule could end, while readFrontier records the
+ * highest token list index that was read (directly or via nested rule calls) to compute the result. Entries
+ * whose frontier reached the caret token are not reusable across completion requests and are only kept for the
+ * current run.
+ */
+export interface IProcessRuleCacheEntry {
+    endStatus: RuleEndStatus;
+    readFrontier: number;
+}
+
+/**
  * All the candidates which have been found. Tokens and rules are separated.
  * Token entries include a list of tokens that directly follow them (see also the "following" member in the
  * FollowSetWithPath class).
@@ -126,21 +149,28 @@ export class CodeCompletionCore {
      */
     public translateRulesTopDown = false;
 
-    private parser: Parser;
-    private atn: ATN;
-    private vocabulary: Vocabulary;
-    private ruleNames: string[];
-    private tokens: Token[];
-    private precedenceStack: number[];
+    protected parser: Parser;
+    protected atn: ATN;
+    protected vocabulary: Vocabulary;
+    protected ruleNames: string[];
+    protected tokens: ICompletionToken[];
+    protected precedenceStack: number[];
 
-    private tokenStartIndex = 0;
-    private statesProcessed = 0;
+    protected tokenStartIndex = 0;
+    protected statesProcessed = 0;
 
     /**
-     * A mapping of rule index + token stream position to end token positions.
-     * A rule which has been visited before with the same input position will always produce the same output positions.
+     * The highest token list index read so far by the currently executing rule walk (including nested rule
+     * calls). Used to compute the read frontier stored with each process rule cache entry.
      */
-    private shortcutMap: Map<number, Map<number, RuleEndStatus>> = new Map();
+    protected readFrontier = 0;
+
+    /**
+     * A mapping of rule index + token list position to end token positions + read frontier.
+     * A rule which has been visited before with the same input position will always produce the same output
+     * positions.
+     */
+    protected shortcutMap: Map<number, Map<number, IProcessRuleCacheEntry>> = new Map();
 
     /** The collected candidates (rules and tokens). */
     private candidates: CandidatesCollection = new CandidatesCollection();
@@ -166,37 +196,9 @@ export class CodeCompletionCore {
      * @returns The collection of completion candidates.
      */
     public collectCandidates(caretTokenIndex: number, context?: ParserRuleContext): CandidatesCollection {
-        this.shortcutMap.clear();
-        this.candidates.rules.clear();
-        this.candidates.tokens.clear();
-        this.statesProcessed = 0;
-        this.precedenceStack = [];
-
+        this.resetRunState();
         this.tokenStartIndex = context?.start ? context.start.tokenIndex : 0;
-        // eslint-disable-next-line no-underscore-dangle
-        const tokenStream: TokenStream = this.parser.tokenStream;
-
-        this.tokens = [];
-        let offset = this.tokenStartIndex;
-        while (true) {
-            const token = tokenStream.get(offset++);
-            if (!token) {
-                break;
-            }
-            if (token.channel === Token.DEFAULT_CHANNEL) {
-                this.tokens.push(token);
-
-                if (token.tokenIndex >= caretTokenIndex || token.type === Token.EOF) {
-                    break;
-                }
-            }
-
-            // Do not check for the token index here, as we want to end with the first unhidden token on or after
-            // the caret.
-            if (token.type === Token.EOF) {
-                break;
-            }
-        }
+        this.tokens = this.loadTokens(caretTokenIndex);
 
         const callStack: RuleWithStartTokenList = [];
         const startRule = context ? context.ruleIndex : 0;
@@ -230,6 +232,66 @@ export class CodeCompletionCore {
         }
 
         return this.candidates;
+    }
+
+    /**
+     * Resets all per-run state. Subclasses can override this to seed the shortcut map from a persistent cache
+     * (e.g. in an incremental completion session).
+     */
+    protected resetRunState(): void {
+        this.shortcutMap.clear();
+        this.candidates.rules.clear();
+        this.candidates.tokens.clear();
+        this.statesProcessed = 0;
+        this.precedenceStack = [];
+    }
+
+    /**
+     * Collects the (default channel) tokens up to the caret, in the order and with the truncation rules used by
+     * the completion algorithm. Subclasses can override this to provide tokens from another source than the
+     * parser token stream.
+     *
+     * @param caretTokenIndex The index of the token at the caret position.
+     * @returns The token list used for the current run.
+     */
+    protected loadTokens(caretTokenIndex: number): ICompletionToken[] {
+        // eslint-disable-next-line no-underscore-dangle
+        const tokenStream: TokenStream = this.parser.tokenStream;
+
+        const tokens: ICompletionToken[] = [];
+        let offset = this.tokenStartIndex;
+        while (true) {
+            const token = tokenStream.get(offset++);
+            if (!token) {
+                break;
+            }
+            if (token.channel === Token.DEFAULT_CHANNEL) {
+                tokens.push(token);
+
+                if (token.tokenIndex >= caretTokenIndex || token.type === Token.EOF) {
+                    break;
+                }
+            }
+
+            // Do not check for the token index here, as we want to end with the first unhidden token on or after
+            // the caret.
+            if (token.type === Token.EOF) {
+                break;
+            }
+        }
+
+        return tokens;
+    }
+
+    /**
+     * Returns the key under which statically determined follow sets are shared. This is the parser class name by
+     * default, matching the historical behavior. Incremental sessions may extend it (e.g. with a predicate result
+     * version) to avoid sharing follow sets computed with different semantic predicate outcomes.
+     *
+     * @returns The follow set cache key.
+     */
+    protected getFollowSetsCacheKey(): string {
+        return this.parser.constructor.name;
     }
 
     /**
@@ -482,12 +544,16 @@ export class CodeCompletionCore {
             positionMap = new Map();
             this.shortcutMap.set(startState.ruleIndex, positionMap);
         } else {
-            if (positionMap.has(tokenListIndex)) {
+            const cachedEntry = positionMap.get(tokenListIndex);
+            if (cachedEntry) {
                 if (this.showDebugOutput) {
                     console.log("=====> shortcut");
                 }
 
-                return positionMap.get(tokenListIndex)!;
+                // The cached walk read up to its frontier, so the caller walk effectively did as well.
+                this.readFrontier = Math.max(this.readFrontier, cachedEntry.readFrontier);
+
+                return cachedEntry;
             }
         }
 
@@ -500,10 +566,10 @@ export class CodeCompletionCore {
         // 3) We get this lookup for free with any 2nd or further visit of the same rule, which often happens
         //    in non trivial grammars, especially with (recursive) expressions and of course when invoking code
         //    completion multiple times.
-        let setsPerState = CodeCompletionCore.followSetsByATN.get(this.parser.constructor.name);
+        let setsPerState = CodeCompletionCore.followSetsByATN.get(this.getFollowSetsCacheKey());
         if (!setsPerState) {
             setsPerState = new Map();
-            CodeCompletionCore.followSetsByATN.set(this.parser.constructor.name, setsPerState);
+            CodeCompletionCore.followSetsByATN.set(this.getFollowSetsCacheKey(), setsPerState);
         }
 
         let followSets = setsPerState.get(startState.stateNumber);
